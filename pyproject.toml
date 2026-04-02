@@ -1,0 +1,50 @@
+[project]
+name = "web2textpy"
+version = "0.1.0"
+description = "Python reimplementation of the Web2Text pipeline for labeling HTML DOM nodes as content or boilerplate"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+    { name = "William Brach" },
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Text Processing :: Markup :: HTML",
+]
+dependencies = [
+    "lxml>=6.0.2",
+]
+
+[project.optional-dependencies]
+eval = [
+    "rouge-score>=0.1.2",
+    "sacrebleu>=2.6.0",
+]
+cli = [
+    "datasets>=4.8.4",
+    "rouge-score>=0.1.2",
+    "sacrebleu>=2.6.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/williambrach/web2textpy"
+Repository = "https://github.com/williambrach/web2textpy"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["web2text.py"]
+
+[tool.hatch.build.targets.sdist]
+exclude = ["assets/", "evaluate.py", "push_to_hf.py"]
