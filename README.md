@@ -23,6 +23,13 @@ print(extracted_text[:200])
 print(metrics)
 ```
 
+## Get text from labeled HTML
+
+```python
+from web2text import extract_text_from_labeled_html
+text = extract_text_from_labeled_html(labeled_html_string)
+```
+
 ## Step-by-Step API
 
 Each stage of the pipeline is exposed as a standalone function:
