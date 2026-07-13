@@ -656,7 +656,16 @@ def label_nodes(
 # ---------------------------------------------------------------------------
 
 def extract_text(tree: etree._Element) -> str:
-    """Reconstruct clean text from content-labeled leaf nodes."""
+    """Reconstruct clean text from content-labeled *leaf* nodes.
+
+    Pipeline-internal: this is correct only on a tree that has gone through
+    :func:`extract_leaves`, which splits internal-node text and child tails into
+    synthetic ``<span>`` leaves. On such a tree every text block is a leaf, so
+    the ``len(el) == 0`` rule captures all content. Do NOT call this directly on
+    a freshly parsed labeled document — internal-node prose is not a leaf there
+    and would be dropped; use :func:`extract_text_direct` /
+    :func:`extract_text_from_labeled_html` instead.
+    """
     parts: list[str] = []
     for el in tree.iter():
         if not isinstance(el.tag, str):
@@ -668,16 +677,168 @@ def extract_text(tree: etree._Element) -> str:
     return "\n".join(parts)
 
 
+def _append_own_text(parts: list[str], el: etree._Element) -> None:
+    """Append a content node's OWN text -- ``el.text`` then ``el.tail`` -- to *parts*.
+
+    ``el.text`` is the text before the node's first child; ``el.tail`` is the
+    text after the node, in the parent's flow. Each is stripped, normalized, and
+    skipped when empty. No subtree recursion: descendants contribute their own
+    text only when they too are content-labeled and visited in their own right.
+    """
+    for segment in (el.text, el.tail):
+        if segment and segment.strip():
+            text = normalize_text(segment)
+            if text:
+                parts.append(text)
+
+
+def extract_text_direct(tree: etree._Element) -> str:
+    """Reconstruct content text from an already-labeled tree using direct node text.
+
+    Emits each content-labeled node's own ``el.text`` + ``el.tail`` in document
+    order, without recursing into subtrees. Unlike :func:`extract_text` (leaf
+    only, pipeline-internal), this captures article prose living on internal /
+    inline nodes: in ``<p>before <a>link</a> after.</p>`` the ``before`` is
+    ``p.text`` and ``after.`` is ``a.tail``, both recovered. Boilerplate-labeled
+    descendants of a content node are excluded.
+    """
+    parts: list[str] = []
+    for el in tree.iter():
+        if not isinstance(el.tag, str):
+            continue
+        if el.get("data-label") == "content":
+            _append_own_text(parts, el)
+    return "\n".join(parts)
+
+
 def extract_text_from_labeled_html(labeled_html: str) -> str:
     """Extract content text from an already-labeled HTML string.
 
     Accepts HTML where elements carry ``data-label="content"`` or
-    ``data-label="boilerplate"`` attributes (e.g. the ``labeled_html``
-    column produced by :func:`label_original_html`) and returns only
-    the text of content-labeled leaf nodes.
+    ``data-label="boilerplate"`` attributes (e.g. the ``labeled_html`` column
+    produced by :func:`label_original_html`) and returns the text of
+    content-labeled nodes via :func:`extract_text_direct` -- i.e. each content
+    node's own ``el.text`` + ``el.tail`` in document order. (Previously this
+    emitted only content-labeled *leaf* nodes, which dropped the substantial
+    fraction of article prose that lives on internal/inline DOM nodes.)
     """
     doc = document_fromstring(labeled_html)
-    return extract_text(doc)
+    return extract_text_direct(doc)
+
+
+def extract_text_from_nodes(nodes: list[etree._Element], labels: list[int]) -> str:
+    """Direct content text from parallel lists of DOM nodes and 0/1 labels.
+
+    For callers that already hold classified lxml elements (e.g. a GNN node
+    classifier) rather than a labeled HTML string. Emits each content-labeled
+    (``label == 1``) node's own ``el.text`` + ``el.tail`` in list order, matching
+    :func:`extract_text_direct`. ``nodes`` and ``labels`` must be equal length
+    and in document order.
+    """
+    if not nodes:
+        return ""
+    parts: list[str] = []
+    for el, label in zip(nodes, labels, strict=True):
+        if isinstance(el.tag, str) and label == 1:
+            _append_own_text(parts, el)
+    return "\n".join(parts)
+
+
+# Inline-level tags whose text stays merged with the surrounding prose (never a
+# block boundary). Used by the doc-adaptive recovery below.
+INLINE_TAGS = frozenset({
+    "a", "b", "i", "em", "strong", "span", "u", "small", "sub", "sup", "mark",
+    "abbr", "cite", "code", "q", "s", "time", "label", "bdi", "bdo", "wbr",
+    "font", "tt", "kbd", "var",
+})
+
+
+def _inline_recovery_parts(el: etree._Element) -> list[str]:
+    """Text of a content node *el* recovering inline-descendant text + all child tails.
+
+    Emits ``el.text``, then for every descendant: the text of INLINE children
+    (recursively) and the ``.tail`` of EVERY child (inline and block — the
+    block-child tails carry the prose on container-only-labeled docs), then
+    ``el.tail``. Block children's own ``.text`` is reached when they are content
+    nodes in their own right.
+    """
+    parts: list[str] = []
+    if el.text and el.text.strip():
+        parts.append(el.text.strip())
+
+    def walk(node: etree._Element) -> None:
+        for ch in node:
+            if not isinstance(ch.tag, str):
+                if ch.tail and ch.tail.strip():
+                    parts.append(ch.tail.strip())
+                continue
+            if ch.tag in INLINE_TAGS:
+                if ch.text and ch.text.strip():
+                    parts.append(ch.text.strip())
+                walk(ch)
+            if ch.tail and ch.tail.strip():
+                parts.append(ch.tail.strip())
+
+    walk(el)
+    if el.tail and el.tail.strip():
+        parts.append(el.tail.strip())
+    return parts
+
+
+def _content_subtree_words(nodes: list[etree._Element], labels: list[int]) -> int:
+    """Total itertext word count of the maximal content subtrees (content roots)."""
+    id2idx = {id(n): i for i, n in enumerate(nodes)}
+
+    def has_content_ancestor(i: int) -> bool:
+        p = nodes[i].getparent()
+        while p is not None:
+            j = id2idx.get(id(p))
+            if j is not None and labels[j] == 1:
+                return True
+            p = p.getparent()
+        return False
+
+    total = 0
+    for i, lab in enumerate(labels):
+        if lab == 1 and not has_content_ancestor(i):
+            total += len("".join(nodes[i].itertext()).split())
+    return total
+
+
+def extract_text_from_nodes_adaptive(
+    nodes: list[etree._Element], labels: list[int], threshold: float = 0.40
+) -> str:
+    """Doc-adaptive content text: precise own-text by default, recover when labels are coarse.
+
+    Per document, compares the words :func:`extract_text_from_nodes` (variant D)
+    would emit against the total word mass of the content subtrees. If that ratio
+    is below ``threshold`` the labels mark only *containers* (the prose lives in
+    unlabeled descendants), so this recurses to recover it
+    (:func:`_inline_recovery_parts`); otherwise it returns the precise variant-D
+    text. The per-document routing keeps precision high on fine-labeled pages
+    while rescuing the recall-collapsed container-only pages.
+
+    Same ``(nodes, labels)`` contract as :func:`extract_text_from_nodes`; needs
+    no gold and no model change (a binary node classifier's labels suffice).
+    """
+    if not nodes:
+        return ""
+    d_parts: list[str] = []
+    for el, label in zip(nodes, labels, strict=True):
+        if isinstance(el.tag, str) and label == 1:
+            for seg in (el.text, el.tail):
+                if seg and seg.strip():
+                    d_parts.append(seg.strip())
+    d_words = sum(len(s.split()) for s in d_parts)
+    subtree_words = _content_subtree_words(nodes, labels)
+    ratio = d_words / subtree_words if subtree_words > 0 else 1.0
+    if ratio < threshold:
+        parts: list[str] = []
+        for el, label in zip(nodes, labels, strict=True):
+            if isinstance(el.tag, str) and label == 1:
+                parts.extend(_inline_recovery_parts(el))
+        return "\n".join(parts)
+    return "\n".join(d_parts)
 
 
 # ---------------------------------------------------------------------------
@@ -754,6 +915,46 @@ def run_pipeline(
 # ---------------------------------------------------------------------------
 # Label original HTML
 # ---------------------------------------------------------------------------
+
+def disambiguate_content_by_gold(
+    root: etree._Element, clean_text: str, min_tokens: int = 4, frac: float = 0.8
+) -> int:
+    """Gold-guided own-text label repair (build-time): flip prose nodes to content.
+
+    The CDOM->original label transfer in :func:`label_original_html` lands content
+    labels on empty container nodes while the prose-bearing original node is left
+    boilerplate/unlabeled (measured: ~71% of the worst docs' gold-text mass ends up
+    on boilerplate-labeled originals). This pass repairs that: for every node NOT
+    already labeled ``content``, it tokenizes the node's OWN text (``el.text`` +
+    ``el.tail``) and re-labels it ``content`` when it has at least ``min_tokens``
+    tokens and at least ``frac`` of them appear in the gold token set. The
+    ``min_tokens`` guard avoids spuriously flipping short generic strings (e.g.
+    a lone "By") that happen to be gold members.
+
+    Gold-guided is acceptable here because the whole dataset is a pseudo-label set
+    built FROM the gold (``align`` is gold-guided too); the rule only re-labels
+    nodes whose own text the gold already contains, injecting no out-of-document
+    signal, and the GNN never sees the gold at inference. Returns #nodes flipped.
+
+    Run AFTER the apply-to-original loop and BEFORE the upward _propagate so the
+    newly-content nodes propagate to their containers.
+    """
+    gold_tokens = set(_normalize_for_eval(clean_text).lower().split())
+    if not gold_tokens:
+        return 0
+    flipped = 0
+    for el in root.iter():
+        if not isinstance(el.tag, str) or el.get("data-label") == "content":
+            continue
+        own = (el.text or "") + " " + (el.tail or "")
+        toks = _normalize_for_eval(own).lower().split()
+        if len(toks) < min_tokens:
+            continue
+        if sum(1 for t in toks if t in gold_tokens) / len(toks) >= frac:
+            el.set("data-label", "content")
+            flipped += 1
+    return flipped
+
 
 def label_original_html(
     html_str: str, clean_text: str, threshold: float = 0.667,
@@ -906,6 +1107,11 @@ def label_original_html(
         for attr in ("data-orig-id",):
             if attr in el.attrib:
                 del el.attrib[attr]
+
+    # Gold-guided own-text disambiguation: rescue prose-bearing nodes the
+    # CDOM->original label transfer left as boilerplate/unlabeled. Runs before
+    # _propagate so the newly-content nodes bubble up to their containers.
+    disambiguate_content_by_gold(orig_body, clean_text)
 
     # Propagate: unlabeled nodes inherit from children
     def _propagate(el: etree._Element) -> bool:
